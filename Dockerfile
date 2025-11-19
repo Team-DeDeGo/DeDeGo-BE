@@ -2,7 +2,6 @@ FROM python:3.14-slim
 WORKDIR /app
 
 COPY . .
-COPY .env .env
 
 RUN apt-get update && apt-get install -y curl
 

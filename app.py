@@ -1,21 +1,34 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 import json
 import os
 from typing import List, Literal
 from dotenv import load_dotenv
+import httpx
 
 load_dotenv()
 
 app = FastAPI(title="DEDEGO(판교어 번역기) API", version="1.0.0")
 
-# CORS 설정
+def load_pangyo_terms():
+    try:
+        with open("data.json", "r", encoding="utf-8") as f:
+            terms_data = json.load(f)
+        return terms_data
+    except FileNotFoundError:
+        print("Warning: data.json 파일을 찾을 수 없습니다.")
+        return []
+    except json.JSONDecodeError:
+        print("Warning: data.json 파일을 파싱할 수 없습니다.")
+        return []
+
+pangyo_terms = load_pangyo_terms()
+
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://dedego.yuuka.me",
     "https://dedego.vercel.app",
     "https://dedego.kro.kr"
 ]
@@ -28,7 +41,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    timeout=httpx.Timeout(60.0, connect=10.0),
+    max_retries=2
+)
 
 class TranslateRequest(BaseModel):
     text: str
@@ -45,68 +62,82 @@ class TranslateResponse(BaseModel):
     direction: str
     terms: List[TermExplanation]
 
-PROMPT_TEMPLATES = {
-    "to_pangyo": """
+def get_prompt_templates(terms_data):
+    """판교어 용어 사전을 포함한 프롬프트 템플릿을 생성합니다."""
+
+    terms_reference = "\n".join([
+        f"- {term['term']}: {term['definition']}"
+        for term in terms_data
+    ])
+
+    return {
+        "to_pangyo": f"""
 당신은 판교 IT 업계에서 사용하는 "판교어" 전문가입니다.
 
 다음 일반 한국어 문장을 자연스러운 판교어로 번역하고, 사용된 판교어 용어들을 설명해주세요.
 
+**판교어 용어 사전 (참고용):**
+{terms_reference}
+
 **입력 문장:**
-{text}
+{{text}}
 
 **지침:**
-1. 자연스럽고 실제 판교에서 사용할 법한 표현으로 번역
+1. 위 용어 사전을 최대한 활용하여 자연스럽고 실제 판교에서 사용할 법한 표현으로 번역
 2. 영어 비즈니스 용어를 적절히 섞어서 사용하되 영어를 사용하면 안됨 (예: ASAP → 아삽)
-3. 한국어 조사/어미는 유지하되 핵심 명사/동사는 영어로 대체
+3. 한국어 조사/어미는 유지하되 핵심 명사/동사는 영어로 대체, 그러나 영어대신 한국어 발음 표기 사용
 4. 과하게 어렵지 않게, 실무에서 실제 쓰일 법한 수준으로
+5. 용어 사전에 있는 단어를 우선적으로 사용
 
 **응답 형식 (반드시 JSON으로만 응답):**
-{{
+{{{{
   "translated": "번역된 판교어 문장",
   "terms": [
-    {{
+    {{{{
       "term": "사용된 판교어 용어",
       "meaning": "해당 용어의 의미 1줄 정도로 간단히 설명",
       "original": "원어 (예: ASAP, Follow-up 등)"
-    }}
+    }}}}
   ]
-}}
+}}}}
 
 JSON 외 다른 텍스트는 절대 포함하지 마세요.
 """,
-    
-    "to_korean": """
+
+        "to_korean": f"""
 당신은 판교 IT 업계에서 사용하는 "판교어" 전문가입니다.
 
 다음 판교어 문장을 일반인도 이해할 수 있는 표준 한국어로 번역하고, 문장에 포함된 판교어 용어들을 설명해주세요.
 
+**판교어 용어 사전 (참고용):**
+{terms_reference}
+
 **입력 문장:**
-{text}
+{{text}}
 
 **지침:**
-1. 모든 판교어 용어를 표준 한국어로 자연스럽게 번역.
+1. 위 용어 사전을 참고하여 모든 판교어 용어를 표준 한국어로 자연스럽게 번역
 2. 일반 직장인이 쉽게 이해할 수 있는 표현 사용
 3. 비즈니스 맥락은 유지하되 쉬운 언어로 풀어서 설명
 
 **응답 형식 (반드시 JSON으로만 응답):**
-{{
+{{{{
   "translated": "번역된 표준 한국어 문장",
   "terms": [
-    {{
+    {{{{
       "term": "원문에 있던 판교어 용어",
       "meaning": "해당 용어의 의미 1줄 정도로 간단히 설명",
       "original": "원어 (예: ASAP, Follow-up 등)"
-    }}
+    }}}}
   ]
-}}
+}}}}
 
 JSON 외 다른 텍스트는 절대 포함하지 마세요.
 """
-}
+    }
 
 @app.get("/api/")
 async def root():
-    """API 상태 체크"""
     return {
         "service": "DEDEGO(판교어 번역기) API",
         "status": "running",
@@ -119,7 +150,6 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    """헬스 체크"""
     return {"status": "healthy"}
 
 @app.post("/api/translate", response_model=TranslateResponse)
@@ -134,16 +164,17 @@ async def translate_text(request: TranslateRequest):
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="텍스트를 입력해주세요")
 
-        prompt = PROMPT_TEMPLATES[request.direction].format(text=request.text)
+        prompt_templates = get_prompt_templates(pangyo_terms)
+        prompt = prompt_templates[request.direction].format(text=request.text)
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-nano",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that responds only in JSON format."},
                 {"role": "user", "content": prompt}
             ],
-            response_format={"type": "json_object"},
-            temperature=0.7
+            response_format={"type": "json_object"}
+            # temperature=0.7
         )
 
         response_text = response.choices[0].message.content.strip()
