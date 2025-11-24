@@ -173,13 +173,13 @@ async def translate_text(request: TranslateRequest):
         prompt = prompt_templates[request.direction].format(text=request.text)
 
         response = client.chat.completions.create(
-            model="gpt-4.1-nano",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that responds only in JSON format."},
                 {"role": "user", "content": prompt}
             ],
-            response_format={"type": "json_object"}
-            # temperature=0.7
+            response_format={"type": "json_object"},
+            temperature=0.2
         )
 
         response_text = response.choices[0].message.content.strip()
